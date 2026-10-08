@@ -7,13 +7,13 @@ BOLD=$'\e[1m'; RED=$'\e[31m'; RESET=$'\e[0m'
 err() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
 die() { err "$*"; exit 1; }
 
-# --help / -h: print copy-pastable usage and exit BEFORE any Docker work, so help still works when
-# Docker is down or the image isn't built yet. We resolve our own location so every command printed
+# --help / -h: print copy-pastable usage and exit BEFORE any engine work, so help still works when
+# Docker/Podman is down or the image isn't built yet. We resolve our own location so every command printed
 # below is copy-pastable as-is — no matter where the repo was cloned or whether the alias is set up.
 if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   row() { printf '  %-18s %s%s%s\n' "$1" "$BOLD" "$2" "$RESET"; }
-  printf '%sclaude-pod%s — run Claude Code in a Docker sandbox scoped to the current folder.\n' "$BOLD" "$RESET"
+  printf '%sclaude-pod%s — run Claude Code in a Docker/Podman sandbox scoped to the current folder.\n' "$BOLD" "$RESET"
   printf '\n%sRun%s  (cd into your project first — the current folder is what gets mounted):\n' "$BOLD" "$RESET"
   row "Open a shell:"   "$HERE/claude-pod"
   row "Run Claude:"     "$HERE/claude-pod claude --dangerously-skip-permissions"
@@ -25,22 +25,43 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/claude-pod"
   row "Read-only mounts:" "RO_MOUNTS=\"~/docs /opt/data:/data\" $HERE/claude-pod"
   row "Isolate/limit:"  "NET=none MEMORY=4g PIDS=512 $HERE/claude-pod"
+  row "Use Podman:"     "RUNTIME=podman $HERE/claude-pod"
   printf '\n'
   row "Shortcut alias:" "alias claude-pod=$HERE/claude-pod"
   row "Full README:"    "https://github.com/trekhleb/claude-pod"
   exit 0
 fi
 
-# Preflight checks, in causal order. Without these the failures surface as cryptic Docker errors:
-#   - daemon down -> the image check below would falsely blame a missing image.
-#   - missing image -> Docker would try to pull 'claude-pod' from Docker Hub and fail.
+# Container engine: Docker or Podman. RUNTIME=docker|podman picks one explicitly; otherwise we use
+# docker if it's on PATH, else podman. The flavor is detected from `--version` rather than the command
+# name, so a `docker` that is really Podman (the podman-docker shim) still gets the Podman flags below.
+if [ -z "${RUNTIME:-}" ]; then
+  if command -v docker >/dev/null; then RUNTIME=docker
+  elif command -v podman >/dev/null; then RUNTIME=podman
+  else die "Docker or Podman is required, but neither is on PATH."
+  fi
+fi
+command -v "$RUNTIME" >/dev/null || die "Container engine '$RUNTIME' (from RUNTIME) is not on PATH."
+IS_PODMAN=false
+"$RUNTIME" --version 2>/dev/null | grep -qi podman && IS_PODMAN=true
+
+# Preflight checks, in causal order. Without these the failures surface as cryptic engine errors:
+#   - engine down -> the image check below would falsely blame a missing image.
+#   - missing image -> the engine would try to pull 'claude-pod' from a registry and fail.
 # We probe existence with `image ls -q`, not `image inspect`: it resolves the name the same way
 # `docker run` does, so the check can't disagree with whether the run will actually work. (Some
 # Docker Desktop builds have a broken `image inspect <name>` that false-negatives on a present
-# image, which would otherwise wrongly send you to re-run install.sh.)
-command -v docker >/dev/null || die "Docker is required but not on PATH."
-docker info >/dev/null 2>&1 || die "Docker daemon is not running."
-if [ -z "$(docker image ls -q claude-pod 2>/dev/null)" ]; then
+# image, which would otherwise wrongly send you to re-run install.sh.) Podman stores the image as
+# 'localhost/claude-pod' and resolves the bare name to it in both `image ls` and `run`.
+if [ "$IS_PODMAN" = true ]; then
+  # One `podman info` call doubles as the health check and tells us how to set up the run below.
+  PODMAN_INFO="$("$RUNTIME" info --format '{{.Host.Security.Rootless}} {{.Host.Security.SELinuxEnabled}}' 2>/dev/null)" \
+    || die "Podman is not working ('$RUNTIME info' failed). On macOS/Windows, start the VM with 'podman machine start'."
+  read -r PODMAN_ROOTLESS PODMAN_SELINUX <<< "$PODMAN_INFO"
+else
+  "$RUNTIME" info >/dev/null 2>&1 || die "Docker daemon is not running."
+fi
+if [ -z "$("$RUNTIME" image ls -q claude-pod 2>/dev/null)" ]; then
   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   err "Image 'claude-pod' not found."
   die "Please run '${BOLD}${SCRIPT_DIR}/install.sh${RESET}' first to build the local container."
@@ -76,9 +97,9 @@ chmod 600 "$HOME/.claude-pod/.claude.json"
 #   Passing `-t` to Docker in this case would cause a crash.
 #   [ -t 0 ] checks if STDIN is a terminal. If yes, keep it interactive (-i).
 #   [ -t 1 ] checks if STDOUT is a terminal. If yes, allocate a pseudo-TTY (-t).
-DOCKER_FLAGS=("--rm")
-[ -t 0 ] && DOCKER_FLAGS+=("-i")
-[ -t 1 ] && DOCKER_FLAGS+=("-t")
+RUN_FLAGS=("--rm")
+[ -t 0 ] && RUN_FLAGS+=("-i")
+[ -t 1 ] && RUN_FLAGS+=("-t")
 
 # Optional Port Mapping:
 #   Allows users to map dev servers by passing PORTS="3000 8080:80".
@@ -98,9 +119,9 @@ if [ -n "${PORTS:-}" ]; then
       fi
     done
     if [[ "$port" == *":"* ]]; then
-      DOCKER_FLAGS+=("-p" "127.0.0.1:${port}")
+      RUN_FLAGS+=("-p" "127.0.0.1:${port}")
     else
-      DOCKER_FLAGS+=("-p" "127.0.0.1:${port}:${port}")
+      RUN_FLAGS+=("-p" "127.0.0.1:${port}:${port}")
     fi
   done
 fi
@@ -116,6 +137,14 @@ fi
 #   rather than silently downgrading, so a run either gets full read-only protection or doesn't happen.
 #   `--mount` parses its value as CSV, so commas and double quotes in paths are rejected too.
 #   We validate up front so a typo surfaces as a clear error here rather than a cryptic Docker failure.
+#   Podman has no equivalent of bind-recursive=readonly, and its plain `ro` leaves nested mounts
+#   writable, so there we use bind-nonrecursive instead: nested mounts are never carried into the
+#   container. Rootful Podman shows them as empty directories on the read-only parent; rootless Podman
+#   can't uncover them, so the run fails with "crun: mount ...: Invalid argument". Either way it fails
+#   closed, like Docker above: nothing under the path is ever writable.
+#   bind-propagation=private is load-bearing: Podman < 5 adds "rprivate" by default even to a
+#   non-recursive bind, and crun reads that "r" as "make the bind recursive", silently bringing the
+#   nested mounts back in writable. Plain "private" keeps the bind non-recursive on every version.
 #   A leading "~" is expanded here, since it usually arrives quoted and unexpanded by the shell.
 if [ -n "${RO_MOUNTS:-}" ]; then
   for entry in $RO_MOUNTS; do
@@ -136,7 +165,11 @@ if [ -n "${RO_MOUNTS:-}" ]; then
     dst="${dst:-$src}"
     [[ "$dst" == /* ]] || die "RO_MOUNTS container path '$dst' must be absolute."
     [[ "$src$dst" == *[,\"]* ]] && die "RO_MOUNTS path '$src' / '$dst' contains a comma or quote, which isn't supported."
-    DOCKER_FLAGS+=("--mount" "type=bind,src=${src},dst=${dst},readonly,bind-recursive=readonly")
+    if [ "$IS_PODMAN" = true ]; then
+      RUN_FLAGS+=("--mount" "type=bind,src=${src},dst=${dst},readonly,bind-nonrecursive,bind-propagation=private")
+    else
+      RUN_FLAGS+=("--mount" "type=bind,src=${src},dst=${dst},readonly,bind-recursive=readonly")
+    fi
   done
 fi
 
@@ -149,7 +182,7 @@ fi
 #   NET=none and PORTS are mutually exclusive — you can't publish a port on a container with no network.
 if [ "${NET:-}" = "none" ]; then
   [ -n "${PORTS:-}" ] && die "NET=none and PORTS are mutually exclusive: a no-network container can't publish ports."
-  DOCKER_FLAGS+=("--network=none")
+  RUN_FLAGS+=("--network=none")
 fi
 
 # Resource Limits (host availability):
@@ -160,9 +193,24 @@ fi
 #   MEMORY/CPUS are opt-in with no default on purpose: a fixed memory cap would OOM-kill legitimate
 #     large builds, and the right ceiling depends on your host's RAM. Set e.g. MEMORY=4g CPUS=2
 #     when running code you don't trust.
-DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
-[ -n "${MEMORY:-}" ] && DOCKER_FLAGS+=("--memory=$MEMORY")
-[ -n "${CPUS:-}" ]   && DOCKER_FLAGS+=("--cpus=$CPUS")
+RUN_FLAGS+=("--pids-limit=${PIDS:-4096}")
+[ -n "${MEMORY:-}" ] && RUN_FLAGS+=("--memory=$MEMORY")
+[ -n "${CPUS:-}" ]   && RUN_FLAGS+=("--cpus=$CPUS")
+
+# Podman-specific setup:
+#   --userns=keep-id   Rootless Podman maps container UIDs onto your subordinate UID range, so a plain
+#                      --user would write project files as some unrelated host UID (and see your own
+#                      files as owned by root). keep-id maps your UID/GID to the same values inside, so
+#                      ownership lines up exactly as it does with Docker. Rootful Podman needs nothing.
+#   :z                 On SELinux hosts (Fedora, RHEL, a `podman machine` VM), bind mounts are
+#                      unreadable from the container until relabeled; z applies the shared container
+#                      label to the project folder and ~/.claude-pod. Skipped when SELinux is off.
+#                      RO_MOUNTS are deliberately not relabeled — see the README.
+MOUNT_OPTS=""
+if [ "$IS_PODMAN" = true ]; then
+  [ "$PODMAN_ROOTLESS" = true ] && RUN_FLAGS+=("--userns=keep-id")
+  [ "$PODMAN_SELINUX" = true ] && MOUNT_OPTS=":z"
+fi
 
 # Hardening:
 #   --cap-drop=ALL                       Drop all Linux capabilities. An interactive dev shell
@@ -178,14 +226,14 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 # iTerm2, VS Code, WezTerm, etc., or nothing when the host doesn't advertise it, so a non-truecolor
 # terminal is never forced into colors it can't render. Without this, docker leaves the container at
 # TERM=xterm with no COLORTERM and supports-color downshifts the whole UI to 16 colors.
-exec docker run "${DOCKER_FLAGS[@]}" \
+exec "$RUNTIME" run "${RUN_FLAGS[@]}" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
   -e HOME=/home/claude-pod \
   -e COLORTERM \
-  -v "$PWD:$PWD" \
+  -v "$PWD:$PWD$MOUNT_OPTS" \
   -w "$PWD" \
-  -v "$HOME/.claude-pod:/home/claude-pod/.claude" \
-  -v "$HOME/.claude-pod/.claude.json:/home/claude-pod/.claude.json" \
+  -v "$HOME/.claude-pod:/home/claude-pod/.claude$MOUNT_OPTS" \
+  -v "$HOME/.claude-pod/.claude.json:/home/claude-pod/.claude.json$MOUNT_OPTS" \
   claude-pod "$@"

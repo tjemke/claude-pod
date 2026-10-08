@@ -1,12 +1,12 @@
 # claude-pod
 
-> Docker sandbox for the Claude Code CLI. Runs Claude against one project folder — including with `--dangerously-skip-permissions` — while your home directory, SSH keys, and other projects stay invisible to the container. Unofficial.
+> Docker (or Podman) sandbox for the Claude Code CLI. Runs Claude against one project folder — including with `--dangerously-skip-permissions` — while your home directory, SSH keys, and other projects stay invisible to the container. Unofficial.
 
 ![claude-pod](assets/cover.jpeg)
 
 ## TL;DR
 
-`claude-pod` runs Claude Code inside a Docker container that mounts the project folder you launch it from. Claude can read and edit that folder; the rest of your machine — home directory, SSH keys, other projects, host shell — isn't mounted, so the container can't see it.
+`claude-pod` runs Claude Code inside a Docker or Podman container that mounts the project folder you launch it from. Claude can read and edit that folder; the rest of your machine — home directory, SSH keys, other projects, host shell — isn't mounted, so the container can't see it.
 
 It's useful in two cases:
 
@@ -38,7 +38,7 @@ cd ~/projects/your-project
 ~/tools/claude-pod/claude-pod --help
 ```
 
-Docker is the only requirement — no Node.js, npm, or `claude` needed on your host. For the full threat model and the four-file design, see [Security and limits](#security-and-limits). For the official approach, see Anthropic's [Claude Code sandboxing documentation](https://code.claude.com/docs/en/sandboxing).
+Docker (or Podman) is the only requirement — no Node.js, npm, or `claude` needed on your host. For the full threat model and the four-file design, see [Security and limits](#security-and-limits). For the official approach, see Anthropic's [Claude Code sandboxing documentation](https://code.claude.com/docs/en/sandboxing).
 
 ## Contents
 
@@ -52,6 +52,7 @@ Docker is the only requirement — no Node.js, npm, or `claude` needed on your h
   - [Pasting images and screenshots](#pasting-images-and-screenshots)
   - [Updating or pinning the Claude Code version](#updating-or-pinning-the-claude-code-version)
   - [Customizing the image](#customizing-the-image)
+  - [Using Podman](#using-podman)
 - [Security and limits](#security-and-limits)
   - [What it actually does](#what-it-actually-does)
   - [What is and isn't isolated](#what-is-and-isnt-isolated)
@@ -66,7 +67,7 @@ Docker is the only requirement — no Node.js, npm, or `claude` needed on your h
 
 ### Requirements
 
-**Just Docker.** Claude Code runs inside the container, not on your host — you do not need Node.js, npm, or the `claude` CLI installed on your machine. The host stays untouched apart from one state folder (`~/.claude-pod/`) that exists only to keep your login across container restarts.
+**Just Docker — or Podman** (see [Using Podman](#using-podman)). Claude Code runs inside the container, not on your host — you do not need Node.js, npm, or the `claude` CLI installed on your machine. The host stays untouched apart from one state folder (`~/.claude-pod/`) that exists only to keep your login across container restarts.
 
 ### Running claude-pod
 
@@ -151,7 +152,7 @@ RO_MOUNTS="/opt/datasets:/data" claude-pod
 
 Each path must exist (`claude-pod` fails fast instead of letting Docker create an empty folder), a leading `~` is expanded for you, and `/` is refused. Paths containing spaces, colons, commas, or double quotes aren't supported. Files work as well as directories.
 
-Mounts are **recursively** read-only, so any filesystem mounted *underneath* a listed path (an NFS share, an autofs mount) is read-only too. This needs Docker Engine 25+ and Linux kernel 5.12+ (on Docker Desktop, the kernel of its VM). If either is older, Docker refuses to start the container rather than quietly leaving nested mounts writable.
+Mounts are **recursively** read-only, so any filesystem mounted *underneath* a listed path (an NFS share, an autofs mount) is read-only too. This needs Docker Engine 25+ and Linux kernel 5.12+ (on Docker Desktop, the kernel of its VM). If either is older, Docker refuses to start the container rather than quietly leaving nested mounts writable. Podman can't make nested mounts read-only, so under Podman they're left out of the container instead — see [Using Podman](#using-podman).
 
 Read-only stops Claude from *modifying* these paths. It can still read them, and with outbound network open it can still send what it reads elsewhere. Don't mount `~`, `~/.ssh`, or anything holding secrets. See [What is and isn't isolated](#what-is-and-isnt-isolated).
 
@@ -186,6 +187,25 @@ Pinned versions cache normally across rebuilds. The script prints the resolved v
 
 The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + Claude Code. Nothing language-specific. Anything your projects need (Python, build tools, other toolchains) you add yourself — edit the `Dockerfile` and re-run `~/tools/claude-pod/install.sh`.
 
+### Using Podman
+
+All three scripts work with [Podman](https://podman.io/) as well as Docker, including rootless Podman. They use `docker` if it's on your `PATH` and fall back to `podman` otherwise. To choose explicitly (for example, when both are installed), set `RUNTIME`:
+
+```sh
+RUNTIME=podman ~/tools/claude-pod/install.sh
+RUNTIME=podman claude-pod
+# Or set it once in your shell rc:  export RUNTIME=podman
+```
+
+A `docker` command that is really Podman (the `podman-docker` package) is detected and treated as Podman. Tested with Podman 4.3 (Debian 12) and 5.x. On macOS and Windows, start the VM first with `podman machine start`.
+
+Under Podman, `claude-pod` adjusts a few things automatically:
+
+- **Rootless Podman** runs with `--userns=keep-id`, so files Claude creates in your project are owned by you, just as with Docker. (Without it, rootless Podman would write them as a subordinate UID that you can't easily edit or delete.)
+- **SELinux hosts** (Fedora, RHEL, and the `podman machine` VM): the project folder and `~/.claude-pod/` are mounted with `:z`, which relabels them so the container can read them. This sets an SELinux label on those files on the host and changes nothing else. `RO_MOUNTS` paths are *not* relabeled, because they're often not yours to relabel. If one is unreadable inside the pod, relabel it yourself (`chcon -Rt container_file_t PATH`) or leave it out.
+- **`RO_MOUNTS`**: Podman can't make nested mounts read-only (its plain `ro` leaves them writable), so claude-pod doesn't carry them into the container at all. Rootful Podman shows them as empty folders. Rootless Podman can't hide them, so the run fails with `crun: mount ...: Invalid argument`. In that case, list the nested mount itself in `RO_MOUNTS` instead of its parent. Either way, nothing under a read-only path is writable.
+- **`MEMORY` / `CPUS` / `PIDS`** on rootless Podman need cgroups v2 with those controllers delegated to your user. This is the default on current systemd distros. Otherwise see [Podman's troubleshooting guide](https://github.com/containers/podman/blob/main/troubleshooting.md#26-running-containers-with-resource-limits-fails-with-a-permissions-error).
+
 ## Security and limits
 
 ### What it actually does
@@ -193,8 +213,8 @@ The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `
 The whole tool is four tiny files:
 
 - **`Dockerfile`** — `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `@anthropic-ai/claude-code`.
-- **`claude-pod`** — one `docker run` command that mounts your current directory (plus a small state dir for login and history) and nothing else of your machine.
-- **`install.sh`** — checks Docker and builds the image. Doesn't touch any system path; the tool stays self-contained in this folder.
+- **`claude-pod`** — one `docker run` (or `podman run`) command that mounts your current directory (plus a small state dir for login and history) and nothing else of your machine.
+- **`install.sh`** — checks Docker/Podman and builds the image. Doesn't touch any system path; the tool stays self-contained in this folder.
 - **`uninstall.sh`** — removes the image and `~/.claude-pod/` (auth + session history) after confirmation. Lists what it doesn't touch so you can clean those up yourself.
 
 ### What is and isn't isolated
@@ -245,8 +265,8 @@ PIDS=512 claude-pod
 Everything this repo causes to exist outside the project you launch it from:
 
 - `~/.claude-pod/` on your host — auth token, settings, and per-project session/conversation history (transcripts can include code snippets and command output Claude saw). Auth and settings are shared across projects (one login, ever); session history lives under `~/.claude-pod/projects/<encoded-host-path>/`, one folder per project, using the same encoding host-Claude uses — so if you ever switch to a host install, you can copy the folders over and keep your transcripts. This is *not* a host Claude install; it's a state directory for the container's Claude, kept on the host so it survives restarts.
-- Docker image `claude-pod` and its layers, plus the `node:24-slim` base image, in Docker's image store.
-- Docker build cache from `apt-get` and `npm install` steps.
+- Image `claude-pod` and its layers, plus the `node:24-slim` base image, in Docker's (or Podman's) image store.
+- Build cache from `apt-get` and `npm install` steps.
 - Outbound network during build: Docker Hub, Debian apt mirrors, npm registry. During runtime: `api.anthropic.com` and whatever your project code reaches (network is unrestricted).
 - While a session is running: one container process, and any ports you explicitly mapped via `PORTS` bound on `127.0.0.1`.
 
@@ -256,10 +276,10 @@ No `sudo`, no writes to `/usr/local/`, `/etc/`, `~/.zshrc`, `~/Library/`, your e
 
 ### Platforms
 
-The wrapper is portable POSIX bash + Docker. It should work on any host with a recent Docker:
+The wrapper is portable POSIX bash + Docker or Podman. It should work on any host with a recent Docker (or Podman 4.3+, see [Using Podman](#using-podman)):
 
 - **macOS** (Apple Silicon and Intel) with Docker Desktop, OrbStack, or Colima — primary development target.
-- **Linux** with Docker Engine or Docker Desktop — bind mounts and `--user` UID/GID map directly here, the most native experience.
+- **Linux** with Docker Engine, Docker Desktop, or Podman (rootless or rootful) — bind mounts and `--user` UID/GID map directly here, the most native experience.
 - **Windows + WSL2** with Docker Desktop's WSL2 backend — run `claude-pod` from inside a WSL distribution's bash shell.
 
 **Native Windows** (`cmd.exe` / PowerShell) is not supported. The wrapper is a bash script and uses POSIX tools (`id`, etc.); use WSL2 instead.
