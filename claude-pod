@@ -23,6 +23,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   row "Uninstall:"      "$HERE/uninstall.sh"
   printf '\n%sOptions%s  (prefix any run command):\n' "$BOLD" "$RESET"
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/claude-pod"
+  row "Read-only mounts:" "RO_MOUNTS=\"~/docs /opt/data:/data\" $HERE/claude-pod"
   row "Isolate/limit:"  "NET=none MEMORY=4g PIDS=512 $HERE/claude-pod"
   printf '\n'
   row "Shortcut alias:" "alias claude-pod=$HERE/claude-pod"
@@ -101,6 +102,41 @@ if [ -n "${PORTS:-}" ]; then
     else
       DOCKER_FLAGS+=("-p" "127.0.0.1:${port}:${port}")
     fi
+  done
+fi
+
+# Optional Read-Only Mounts:
+#   Lets Claude read extra host paths (reference repos, datasets, shared docs) without being able to
+#   modify them, e.g. RO_MOUNTS="~/docs ../shared-lib /opt/data:/data".
+#   Each entry is "PATH" (mounted at the same absolute path, like $PWD) or "HOST:CONTAINER".
+#   Entries are whitespace-separated, so paths containing spaces or colons aren't supported.
+#   Mounts are recursively read-only (bind-recursive=readonly): plain `-v ...:ro` can leave submounts
+#   under the path (e.g. an NFS share or autofs mount nested inside it) writable on older Docker or
+#   kernels. This option requires Docker Engine 25+ and kernel 5.12+, and Docker refuses to start
+#   rather than silently downgrading, so a run either gets full read-only protection or doesn't happen.
+#   `--mount` parses its value as CSV, so commas and double quotes in paths are rejected too.
+#   We validate up front so a typo surfaces as a clear error here rather than a cryptic Docker failure.
+#   A leading "~" is expanded here, since it usually arrives quoted and unexpanded by the shell.
+if [ -n "${RO_MOUNTS:-}" ]; then
+  for entry in $RO_MOUNTS; do
+    src="${entry%%:*}"
+    dst=""
+    [[ "$entry" == *":"* ]] && dst="${entry#*:}"
+    [[ "$dst" == *":"* ]] && die "RO_MOUNTS entry '$entry' is invalid; expected 'PATH' or 'HOST:CONTAINER'."
+    [[ "$src" == "~" || "$src" == "~/"* ]] && src="$HOME${src#\~}"
+    [ -e "$src" ] || die "RO_MOUNTS path '$src' does not exist."
+    # Absolutize (relative paths resolve against the current folder). Logical `pwd` keeps symlinked
+    # paths as the user wrote them, matching how $PWD itself is mounted.
+    if [ -d "$src" ]; then
+      src="$(cd "$src" && pwd)"
+    else
+      src="$(cd "$(dirname "$src")" && pwd)/$(basename "$src")"
+    fi
+    [ "$src" = "/" ] && die "RO_MOUNTS refuses to mount '/': that exposes your entire filesystem."
+    dst="${dst:-$src}"
+    [[ "$dst" == /* ]] || die "RO_MOUNTS container path '$dst' must be absolute."
+    [[ "$src$dst" == *[,\"]* ]] && die "RO_MOUNTS path '$src' / '$dst' contains a comma or quote, which isn't supported."
+    DOCKER_FLAGS+=("--mount" "type=bind,src=${src},dst=${dst},readonly,bind-recursive=readonly")
   done
 fi
 

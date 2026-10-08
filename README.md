@@ -48,6 +48,7 @@ Docker is the only requirement — no Node.js, npm, or `claude` needed on your h
   - [Aliases](#aliases)
   - [First launch (login)](#first-launch-login)
   - [Exposing ports](#exposing-ports)
+  - [Mounting extra folders read-only](#mounting-extra-folders-read-only)
   - [Pasting images and screenshots](#pasting-images-and-screenshots)
   - [Updating or pinning the Claude Code version](#updating-or-pinning-the-claude-code-version)
   - [Customizing the image](#customizing-the-image)
@@ -133,6 +134,27 @@ PORTS="5173:5173" ~/tools/claude-pod/claude-pod
 >
 > The host-side mapping is still `127.0.0.1`-only (forced by `claude-pod`), so binding `0.0.0.0` inside the container does not expose your dev server to your LAN.
 
+### Mounting extra folders read-only
+
+Sometimes Claude needs to *see* something outside the project (a sibling library, internal docs, a dataset) without being able to change it. List those paths in `RO_MOUNTS` and they're bind-mounted read-only:
+
+```sh
+# Mount at the same absolute path as on the host (like the project folder itself)
+RO_MOUNTS=~/work/shared-lib claude-pod
+
+# Multiple paths, whitespace-separated; relative paths resolve against the current folder
+RO_MOUNTS="~/docs ../shared-lib" claude-pod
+
+# Mount at a different path inside the container (HOST:CONTAINER)
+RO_MOUNTS="/opt/datasets:/data" claude-pod
+```
+
+Each path must exist (`claude-pod` fails fast instead of letting Docker create an empty folder), a leading `~` is expanded for you, and `/` is refused. Paths containing spaces, colons, commas, or double quotes aren't supported. Files work as well as directories.
+
+Mounts are **recursively** read-only, so any filesystem mounted *underneath* a listed path (an NFS share, an autofs mount) is read-only too. This needs Docker Engine 25+ and Linux kernel 5.12+ (on Docker Desktop, the kernel of its VM). If either is older, Docker refuses to start the container rather than quietly leaving nested mounts writable.
+
+Read-only stops Claude from *modifying* these paths. It can still read them, and with outbound network open it can still send what it reads elsewhere. Don't mount `~`, `~/.ssh`, or anything holding secrets. See [What is and isn't isolated](#what-is-and-isnt-isolated).
+
 ### Pasting images and screenshots
 
 Claude can only read files that live **inside the project folder** — that's the one directory bind-mounted into the container. Images on your Desktop or in Downloads aren't mounted, so pasting one straight from there hands Claude a path it can't reach. This is the same isolation that keeps the rest of your machine private from the container ([What is and isn't isolated](#what-is-and-isnt-isolated)); the small bit of friction below is the price for not exposing those default locations.
@@ -178,7 +200,7 @@ The whole tool is four tiny files:
 ### What is and isn't isolated
 
 **Safe from Claude:**
-- Everything outside the project folder you launched from. `~/.ssh`, `~/.aws`, `~/.zshrc`, browser data, other projects — all unreachable.
+- Everything outside the project folder you launched from (and any paths you opt into via `RO_MOUNTS`, which are readable but not writable). `~/.ssh`, `~/.aws`, `~/.zshrc`, browser data, other projects — all unreachable.
 - The host shell. No way to execute commands on your host machine.
 
 **Still exposed:**
